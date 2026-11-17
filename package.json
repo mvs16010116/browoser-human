@@ -1,0 +1,29 @@
+{
+  "name": "browser-human",
+  "version": "1.1.0",
+  "description": "MCP server that drives your existing Chrome over CDP with human-like input, background tabs and network capture",
+  "main": "browser-human.js",
+  "type": "module",
+  "scripts": {
+    "start": "node browser-human.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "mcp",
+    "playwright",
+    "chrome",
+    "cdp",
+    "browser-automation"
+  ],
+  "author": "",
+  "license": "ISC",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@humanjs/playwright": "^0.12.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "playwright": "^1.65.1",
+    "zod": "^4.6.7"
+  }
+}
