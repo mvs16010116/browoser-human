@@ -90,12 +90,27 @@ MCP 客户端配置示例：
 | `MCP_DEBUG_PROFILE` | `%LOCALAPPDATA%\ChromeDebugUserData` | 目录联接路径 |
 | `MCP_KIMI_BRIDGE` | `http://127.0.0.1:10086` | 扩展桥地址（用于 tab 分组，可选） |
 | `MCP_KIMI_SESSION` | `browser-human` | 分组会话名 |
+| `MCP_MAX_TABS` | `5` | 会话标签页上限，超出自动关闭最久未使用的页 |
+| `MCP_IDLE_CLOSE_MS` | `1200000` | 空闲多久后关闭全部会话标签并断开，`0` 表示不启用 |
 
-## 工具清单（35 个）
+## 标签页回收
+
+标签页是有主资源，用完必须归还。本服务从「任务结束」到「进程被强杀」逐层收敛：
+
+1. **任务完成即关闭（主策略）**：服务在 MCP `instructions` 里声明释放约定，随每次会话下发给 agent——每个任务做完就调 `close_browser`，多页探查完先调 `close_tab`
+2. **上限回收**：会话标签超过 `MCP_MAX_TABS`（默认 5）时，自动关闭最久未使用的页，当前页始终保留
+3. **同址复用**：`new_tab` 发现已存在相同 URL 的会话页时直接切换，不再重复开
+4. **空闲回收**：闲置超过 `MCP_IDLE_CLOSE_MS`（默认 20 分钟）后关闭全部会话标签并断开 CDP
+5. **进程退出兜底**：stdin 关闭（客户端断开）或收到 `SIGINT` / `SIGTERM` 时，先关闭本会话标签再退出
+6. **启动清扫**：下次 `open_browser` 时若发现本进程尚未开页但扩展会话里已有标签，说明是上个进程被强杀留下的孤儿页，整会话关闭
+
+第 5、6 层依赖扩展桥（kimi-webbridge）：扩展未启用时，只能靠 1–4 层收敛，强杀残留需手工关闭。会话名由 `MCP_KIMI_SESSION` 决定，同名会话会被一并清理，不要用同一个会话名并行跑多个客户端。
+
+## 工具清单（36 个）
 
 **生命周期**
 
-`open_browser` `close_browser` `restart_chrome_with_debugging` `goto` `page_info` `list_tabs` `new_tab` `switch_tab`
+`open_browser` `close_browser` `restart_chrome_with_debugging` `goto` `page_info` `list_tabs` `new_tab` `switch_tab` `close_tab`
 
 **页面探查**
 

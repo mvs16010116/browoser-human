@@ -6,6 +6,7 @@ import { createHuman } from "@humanjs/playwright";
 import { createNetworkCapture } from "./network-capture.js";
 import { listFrames, resolveFrame } from "./frame-support.js";
 import { formatCookies, readResponse, replayHeaders } from "./http-client.js";
+import { createTabManager, DEFAULT_MAX_TABS, DEFAULT_IDLE_CLOSE_MS } from "./tab-manager.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn, execFile } from "node:child_process";
@@ -41,9 +42,16 @@ let page = null;
 let human = null;
 let mcpWindowId = null;           // 兜底模式下的 MCP 专属窗口
 let tabGroupMode = false;         // true 表示标签开在用户窗口的「BROWSER-HUMAN」分组里
-const sessionPages = new Set();   // 本会话打开的页，关闭时只关这些
+// 标签页上限：超过后按最久未使用顺序回收，避免 agent 反复开页造成标签泛滥
+const MAX_TABS = Number(process.env.MCP_MAX_TABS) || DEFAULT_MAX_TABS;
+// 空闲回收阈值：0 表示不启用；闲置超时后关闭全部会话标签并断开
+const IDLE_CLOSE_MS =
+  process.env.MCP_IDLE_CLOSE_MS === undefined
+    ? DEFAULT_IDLE_CLOSE_MS
+    : Number(process.env.MCP_IDLE_CLOSE_MS);
 let capture = null;               // 网络抓包器，绑定当前页
 let capturePage = null;           // 抓包器绑定的页，换页时重建
+const tabs = createTabManager({ maxTabs: MAX_TABS, idleCloseMs: IDLE_CLOSE_MS });
 
 // 探测本机 Chrome 是否已开启调试端口；未开启时由 open_browser 决定启动或提示重启
 async function isCdpUp() {
@@ -148,14 +156,13 @@ async function launchUserChrome() {
 
 // 结束会话：只关本会话开出的页；CDP 附着下 browser.close() 只断开连接，不会杀掉用户 Chrome
 async function detachOrClose() {
-  for (const p of sessionPages) {
-    try {
-      if (!p.isClosed()) await p.close();
-    } catch {
-      // 页已失效时忽略
-    }
+  // 只在本进程真的开过会话时才清扩展会话，避免刚启动就退出时误清别的客户端标签
+  const hadSession = Boolean(browser) || tabs.size() > 0;
+  await tabs.closeAll();
+  // 已跟踪的页关完后，再让扩展清一次会话：兜住 Playwright 侧丢失的页（如进程内换页失败）
+  if (hadSession) {
+    await kimiCall("close_session", {}, 8000);
   }
-  sessionPages.clear();
   if (browser) {
     try {
       await browser.close();
@@ -206,41 +213,56 @@ async function createBackgroundPage(url = "about:blank") {
   const before = new Set(ctx.pages());
   const beforeTabIds = await kimiTabIds();
 
-  const created = await openInTabGroup(url === "about:blank" ? IDLE_PAGE : url);
+  const opened = await openInTabGroup(url === "about:blank" ? IDLE_PAGE : url);
   // 请求超时但 daemon 可能已经把标签建出来了，先核对 session 里是否真的多了一个标签
-  if (created || (await kimiHasNewTab(beforeTabIds))) {
+  if (opened || (await kimiHasNewTab(beforeTabIds))) {
     const grouped = await waitForNewPage(before, 25000);
     if (grouped) {
       tabGroupMode = true;
-      return grouped;
+      return finishCreation(grouped);
     }
   }
 
   tabGroupMode = false;
-  return openInUserWindow(url, before);
+  return finishCreation(await openInUserWindow(url, before));
 }
 
-// 调 kimi 扩展在用户窗口内建分组标签；扩展未运行或报错时返回 false 交给兜底
-async function openInTabGroup(url) {
+// 最近一次建页时因超限被关闭的数量，用于给 agent 明确反馈
+let lastEvicted = 0;
+
+// 新页就绪后统一做数量收敛：超出上限时关闭最久未使用的页，当前页始终保留
+async function finishCreation(created) {
+  const evicted = await tabs.enforceLimit();
+  lastEvicted = evicted.length;
+  if (evicted.length) {
+    tabs.markReclaimed(evicted.length);
+  }
+  return created;
+}
+
+// 扩展桥的唯一调用入口：daemon 未运行、超时、非 2xx 一律返回 null，由调用方决定兜底
+async function kimiCall(action, args = {}, timeoutMs = 8000) {
   try {
     const res = await fetch(`${KIMI_BRIDGE}/command`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        action: "navigate",
-        args: { url, newTab: true, group_title: TAB_GROUP_TITLE },
-        session: KIMI_SESSION
-      }),
-      signal: AbortSignal.timeout(45000)
+      body: JSON.stringify({ action, args, session: KIMI_SESSION }),
+      signal: AbortSignal.timeout(timeoutMs)
     });
-    if (!res.ok) {
-      return false;
-    }
-    const body = await res.json();
-    return Boolean(body?.ok && body?.data?.success);
+    return res.ok ? await res.json() : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+// 调 kimi 扩展在用户窗口内建分组标签；扩展未运行或报错时返回 false 交给兜底
+async function openInTabGroup(url) {
+  const body = await kimiCall(
+    "navigate",
+    { url, newTab: true, group_title: TAB_GROUP_TITLE },
+    45000
+  );
+  return Boolean(body?.ok && body?.data?.success);
 }
 
 // 用 session 清单确认是否真的新增了标签，用于兜住 daemon 慢半拍的超时误判
@@ -262,21 +284,34 @@ async function kimiHasNewTab(beforeIds) {
 
 // 读取当前 session 的标签 id 集合；daemon 不可用时返回 null
 async function kimiTabIds() {
-  try {
-    const res = await fetch(`${KIMI_BRIDGE}/command`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action: "list_tabs", args: {}, session: KIMI_SESSION }),
-      signal: AbortSignal.timeout(8000)
-    });
-    if (!res.ok) {
-      return null;
-    }
-    const tabs = (await res.json())?.data?.tabs || [];
-    return new Set(tabs.map((t) => t.tabId));
-  } catch {
+  const body = await kimiCall("list_tabs");
+  if (!body?.ok) {
     return null;
   }
+  const list = body?.data?.tabs || [];
+  return new Set(list.map((t) => t.tabId));
+}
+
+/**
+ * 清扫上一个进程残留的会话标签：
+ * 本进程尚未开过任何页（tabs.size() === 0）而扩展会话里已有标签，
+ * 说明它们是上一个 browser-human 进程被强杀后留下的孤儿页，直接整会话关闭。
+ * 返回清理条数；扩展不可用时返回 0，不做任何猜测性关闭。
+ */
+async function sweepOrphanTabs() {
+  if (tabs.size() > 0) {
+    return 0;
+  }
+  const body = await kimiCall("list_tabs");
+  if (!body?.ok) {
+    return 0;
+  }
+  const leftover = body.data?.tabs?.length || 0;
+  if (leftover === 0) {
+    return 0;
+  }
+  const closed = await kimiCall("close_session", {}, 15000);
+  return closed?.data?.closed || 0;
 }
 
 // 兜底：扩展不可用时用 CDP 在用户已有窗口里后台开标签，绝不新开窗口；
@@ -311,7 +346,7 @@ async function waitForNewPage(before, timeoutMs = 15000) {
     if (fresh) {
       fresh.setDefaultTimeout(30000);
       attachDialogHandler(fresh);
-      sessionPages.add(fresh);
+      tabs.add(fresh);
       return fresh;
     }
     await sleep(100);
@@ -344,6 +379,7 @@ function requirePage() {
   if (!page || page.isClosed()) {
     throw new Error("当前页面已关闭，请重新调用 open_browser");
   }
+  tabs.touch();
   return page;
 }
 
@@ -409,10 +445,19 @@ function describeTarget(args) {
   return `(${args.x},${args.y})`;
 }
 
-const server = new McpServer({
-  name: "browser-human",
-  version: "1.1.0"
-});
+const server = new McpServer(
+  { name: "browser-human", version: "1.1.0" },
+  {
+    // agent 的默认行为是"用完就放着"，这里把释放约定写进协议层，随每次会话下发
+    instructions: [
+      "标签页是有主资源：任务一结束就归还，不要留到会话结束。",
+      "每完成一个任务（信息已取到 / 表单已提交 / 页面已无需保留）后立即调用 close_browser，释放本会话标签并从 Chrome 断开。",
+      "单个任务内开了多个页探查时，用完先调用 close_tab（不传 index）关掉除当前页外的全部，再继续下一步。",
+      "只有需要跨轮次保留状态（如等待人工登录、等待异步结果）时才可暂不关闭，并应在下一轮开头补一次 close_tab。",
+      "不要反复用 new_tab 打开同一站点：相同 URL 会自动复用，但仍应优先 goto。"
+    ].join("\n")
+  }
+);
 
 /* ------------------------------ 生命周期 ------------------------------ */
 
@@ -453,16 +498,42 @@ server.tool("open_browser", {}, async () => {
   // human.paste 依赖剪贴板权限，真实 profile 未授权时静默失败
   await ctx.grantPermissions(["clipboard-read", "clipboard-write"]).catch(() => {});
 
+  // 上一次进程被强杀时扩展分组里会留下孤儿页，先清掉再开新页
+  const swept = await sweepOrphanTabs();
+
   // 在独立窗口后台开页：不与用户标签混在一起，也不把用户当前标签切走
   page = await createBackgroundPage();
   human = await createHuman(page, { personality: "careful", seed: 12345 });
+  startIdleReaper();
 
   const cookieCount = (await ctx.cookies().catch(() => [])).length;
   const tip = launchedByUs
     ? `Chrome 未运行，已用真实 profile 启动并附着（${DEBUG_PROFILE}），Cookie ${cookieCount} 条`
     : `已附着到本机 Chrome（${CDP_ENDPOINT}），复用真实 profile，Cookie ${cookieCount} 条`;
-  return { content: [{ type: "text", text: `✅ ${tip}` }] };
+  const cleaned = swept ? `；已清理上次残留标签 ${swept} 个` : "";
+  const limit = `标签上限 ${MAX_TABS} 个（超出自动关闭最久未使用的页），任务结束请调用 close_browser 释放标签页`;
+  return { content: [{ type: "text", text: `✅ ${tip}${cleaned}；${limit}` }] };
 });
+
+/**
+ * 空闲回收：agent 用完不关页时，闲置超过阈值就关闭全部会话标签并断开，
+ * 避免标签页越积越多。定时器只在有会话时生效，不阻塞进程退出。
+ */
+let idleTimer = null;
+function startIdleReaper() {
+  if (idleTimer || IDLE_CLOSE_MS <= 0) {
+    return;
+  }
+  idleTimer = setInterval(async () => {
+    if (!browser || !tabs.shouldReclaim()) {
+      return;
+    }
+    const closed = await tabs.closeAll();
+    tabs.markReclaimed(closed);
+    await detachOrClose();
+  }, 60000);
+  idleTimer.unref?.();
+}
 
 server.tool("close_browser", {}, async () => {
   if (browser) {
@@ -520,7 +591,8 @@ server.tool("page_info", {}, async () => {
     mode: "attached",
     tabGroup: tabGroupMode ? TAB_GROUP_TITLE : null,
     mcpWindowId,
-    sessionTabs: sessionPages.size,
+    sessionTabs: tabs.size(),
+    maxTabs: MAX_TABS,
     frames: listFrames(p)
   };
   return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
@@ -757,37 +829,94 @@ server.tool("human_sleep", { ms: z.number() }, async ({ ms }) => {
 server.tool("list_tabs", {}, async () => {
   requirePage();
   // 只列本会话的页，用户自己的标签页不暴露、不可误操作
-  const pages = [...sessionPages].filter((p) => !p.isClosed());
+  const pages = tabs.list();
   const list = await Promise.all(pages.map(async (p, i) => ({
     index: i,
     url: p.url(),
     title: await p.title().catch(() => ""),
-    active: p === page
+    active: p === tabs.getCurrent()
   })));
-  return { content: [{ type: "text", text: JSON.stringify(list, null, 2) }] };
+  return {
+    content: [{
+      type: "text",
+      text: JSON.stringify({ count: list.length, maxTabs: MAX_TABS, idleCloseMs: IDLE_CLOSE_MS, tabs: list }, null, 2)
+    }]
+  };
 });
 
 server.tool("new_tab", { url: z.string() }, async ({ url }) => {
   requirePage();
+  // 同一 URL 已有会话页时直接切换，避免 agent 重复打开相同页面
+  const existing = tabs.list().find((p) => p.url() === url);
+  if (existing) {
+    page = existing;
+    tabs.setCurrent(page);
+    human = await createHuman(page, { personality: "careful", seed: 12345 });
+    return { content: [{ type: "text", text: `♻️ 已有相同地址的标签页，已直接切换: ${url}` }] };
+  }
   page = await createBackgroundPage(url);
   human = await createHuman(page, { personality: "careful", seed: 12345 });
   const where = tabGroupMode ? `标签组「${TAB_GROUP_TITLE}」` : "用户浏览器窗口（未分组）";
+  const extra = lastEvicted ? `；已达上限 ${MAX_TABS}，已自动关闭 ${lastEvicted} 个最久未使用的页` : "";
   return {
-    content: [{ type: "text", text: `✅ 已在${where}后台打开标签页（未抢焦点）: ${url}` }]
+    content: [{ type: "text", text: `✅ 已在${where}后台打开标签页（未抢焦点）: ${url}${extra}` }]
   };
 });
 
 server.tool("switch_tab", { index: z.number() }, async ({ index }) => {
   requirePage();
   // 索引域限定在本会话的页内，绝不切到用户自己的标签页
-  const pages = [...sessionPages].filter((p) => !p.isClosed());
+  const pages = tabs.list();
   if (index < 0 || index >= pages.length) {
     throw new Error(`标签页索引越界：共 ${pages.length} 个`);
   }
   page = pages[index];
+  tabs.setCurrent(page);
   attachDialogHandler(page);
   human = await createHuman(page, { personality: "careful", seed: 12345 });
   return { content: [{ type: "text", text: `✅ 已切换到标签页 ${index}: ${page.url()}` }] };
+});
+
+server.tool("close_tab", {
+  index: z.number().optional().describe("要关闭的标签页索引（见 list_tabs）；不传则关闭除当前页外的全部"),
+  all: z.boolean().default(false).describe("关闭全部会话标签页")
+}, async ({ index, all }) => {
+  requirePage();
+  if (all) {
+    const closed = await tabs.closeAll();
+    page = null;
+    human = null;
+    return {
+      content: [{ type: "text", text: `✅ 已关闭 ${closed} 个会话标签页；继续操作请调用 open_browser` }]
+    };
+  }
+  if (index === undefined) {
+    const closed = await tabs.closeAll({ keepCurrent: true });
+    return { content: [{ type: "text", text: `✅ 已关闭 ${closed} 个会话标签页，保留当前页` }] };
+  }
+  const pages = tabs.list();
+  if (index < 0 || index >= pages.length) {
+    throw new Error(`标签页索引越界：共 ${pages.length} 个`);
+  }
+  const target = pages[index];
+  const closingCurrent = target === tabs.getCurrent();
+  await tabs.close(target);
+  if (closingCurrent) {
+    const rest = tabs.list();
+    page = rest[0] || null;
+    if (page) {
+      tabs.setCurrent(page);
+      human = await createHuman(page, { personality: "careful", seed: 12345 });
+    } else {
+      human = null;
+    }
+  }
+  return {
+    content: [{
+      type: "text",
+      text: `✅ 已关闭标签页 ${index}；当前会话剩余 ${tabs.size()} 个`
+    }]
+  };
 });
 
 /* ------------------------------ JS 弹窗 ------------------------------ */
@@ -957,6 +1086,28 @@ server.tool("http_request", {
   const summary = JSON.stringify({ status: resp.status(), statusText: resp.statusText(), headers: resp.headers() }, null, 2);
   return { content: [{ type: "text", text: `${summary}\n\n${text}` }] };
 });
+
+/**
+ * 进程退出兜底：客户端断开（stdin EOF）或被信号终止时，先归还本会话标签再退出。
+ * 强杀（taskkill /F）拦不住，这类残留交给下次 open_browser 的 sweepOrphanTabs 清理。
+ */
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) {
+    return;
+  }
+  shuttingDown = true;
+  try {
+    await Promise.race([detachOrClose(), sleep(4000)]);
+  } catch {
+    // 退出路径不再抛错，避免掩盖真实退出原因
+  }
+  process.exit(0);
+}
+
+process.stdin.on("end", shutdown);
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
 
 async function bootstrap() {
   await server.connect(new StdioServerTransport());

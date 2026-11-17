@@ -48,3 +48,4 @@ export async function readResponse(resp, maxChars) {
     : `[二进制响应 ${buffer.length} 字节，以下为 base64 前缀]\n${buffer.toString("base64")}`;
   return raw.length > maxChars ? `${raw.slice(0, maxChars)}\n…（已截断，共 ${raw.length} 字符）` : raw;
 }
+
