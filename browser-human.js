@@ -7,8 +7,11 @@ import { createNetworkCapture } from "./network-capture.js";
 import { listFrames, resolveFrame } from "./frame-support.js";
 import { formatCookies, readResponse, replayHeaders } from "./http-client.js";
 import { createTabManager, DEFAULT_MAX_TABS, DEFAULT_IDLE_CLOSE_MS } from "./tab-manager.js";
+import { routeFor, STRICT_SITES } from "./site-policy.js";
+import { patchChromeAutolaunch, patchChromeShortcuts } from "./chrome-shortcuts.js";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -16,6 +19,8 @@ const execFileAsync = promisify(execFile);
 
 // 唯一工作方式：附着用户的 Chrome，复用真实登录态；禁止另起任何浏览器实例
 const CDP_ENDPOINT = process.env.MCP_CHROME_CDP || "http://127.0.0.1:9222";
+// 实际使用的端点：默认 9222；若用户 Chrome 已用其他调试端口启动，附着前会自动切换到该端口
+let cdpEndpoint = CDP_ENDPOINT;
 const CHROME_PATH =
   process.env.MCP_CHROME_PATH || "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
 // 用户真实 profile（登录态所在），与桌面快捷方式一致
@@ -53,10 +58,10 @@ let capture = null;               // 网络抓包器，绑定当前页
 let capturePage = null;           // 抓包器绑定的页，换页时重建
 const tabs = createTabManager({ maxTabs: MAX_TABS, idleCloseMs: IDLE_CLOSE_MS });
 
-// 探测本机 Chrome 是否已开启调试端口；未开启时由 open_browser 决定启动或提示重启
-async function isCdpUp() {
+// 探测指定端点（默认当前端点）的调试端口是否可用
+async function isCdpUp(endpoint = cdpEndpoint) {
   try {
-    const res = await fetch(`${CDP_ENDPOINT}/json/version`, {
+    const res = await fetch(`${endpoint}/json/version`, {
       signal: AbortSignal.timeout(1500)
     });
     return res.ok;
@@ -73,6 +78,22 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // 关闭 cursor 后仍保留 CDP Input 的真实键鼠事件（isTrusted=true），不损失拟人输入能力。
 const HUMAN_OPTIONS = { personality: "careful", seed: 12345, cursor: false };
 const ACTION_JITTER_MS = Number(process.env.MCP_ACTION_JITTER_MS ?? 180);
+// 可见性断言：后台页发送输入会被浏览器丢弃，动作前必须确认页面可见。MCP_VISIBILITY_GUARD=0 关闭
+const VISIBILITY_GUARD = process.env.MCP_VISIBILITY_GUARD !== "0";
+// Playwright 默认给后台页伪造焦点；关掉后 hasFocus 与 visibilityState 不再矛盾。MCP_FOCUS_EMULATION=1 恢复默认
+const DISABLE_FOCUS_EMULATION = process.env.MCP_FOCUS_EMULATION !== "1";
+// 点击前的贝塞尔轨迹：补掉「瞬移点击」这一行为特征。MCP_POINTER_TRAIL=0 关闭
+const POINTER_TRAIL = process.env.MCP_POINTER_TRAIL !== "0";
+// 输入分块：整段一次性注入是最易被行为风控统计的节奏特征
+const TYPE_CHUNK_MIN = 8;
+const TYPE_CHUNK_MAX = 12;
+const TYPE_GAP_MIN_MS = 50;
+const TYPE_GAP_MAX_MS = 150;
+// 指纹自检：落盘供排障，DEBUG_FINGERPRINT=1 时随 page_info 返回
+const DEBUG_FINGERPRINT = process.env.DEBUG_FINGERPRINT === "1";
+const LOG_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "logs");
+const FINGERPRINT_LOG = path.join(LOG_DIR, "fingerprint.log");
+let lastFingerprint = null;
 
 function createStealthHuman(page) {
   return createHuman(page, HUMAN_OPTIONS);
@@ -81,6 +102,84 @@ function createStealthHuman(page) {
 async function stealthPause() {
   if (ACTION_JITTER_MS <= 0) return;
   await sleep(Math.floor(Math.random() * ACTION_JITTER_MS));
+}
+
+// 通道路由的可读描述：把「该不该用这条通道」变成显式信息，而不是静默失败
+function describeRoute(url) {
+  const route = routeFor(url, STRICT_SITES);
+  return route.strict
+    ? `通道 ${route.channel}（${route.reason}；写操作建议改用 kimi-webbridge：navigate / snapshot / click / fill）`
+    : `通道 ${route.channel}（${route.reason}）`;
+}
+
+// 关掉 Playwright 的焦点模拟：后台页不该同时表现为 hidden 且有焦点
+async function relaxFocusEmulation(target) {
+  if (!DISABLE_FOCUS_EMULATION) {
+    return;
+  }
+  try {
+    const cdp = await target.context().newCDPSession(target);
+    try {
+      await cdp.send("Emulation.setFocusEmulationEnabled", { enabled: false });
+    } finally {
+      await cdp.detach().catch(() => {});
+    }
+  } catch {
+    // 会话建立失败不影响主流程
+  }
+}
+
+// 采集页面内可观测的自动化特征，用于确认改造后还有哪些矛盾值
+async function collectFingerprint(target) {
+  return target.evaluate(async () => {
+    let notificationPermission = "unsupported";
+    try {
+      const status = await navigator.permissions.query({ name: "notifications" });
+      notificationPermission = status.state;
+    } catch {
+      // 部分上下文不支持该权限查询
+    }
+    return {
+      webdriver: navigator.webdriver,
+      visibilityState: document.visibilityState,
+      hasFocus: document.hasFocus(),
+      notificationPermission,
+      chromeObject: typeof window.chrome
+    };
+  });
+}
+
+// 指纹自检落盘：失败只影响日志，不影响业务动作
+async function recordFingerprint(target) {
+  try {
+    const snapshot = { at: new Date().toISOString(), url: target.url(), ...(await collectFingerprint(target)) };
+    lastFingerprint = snapshot;
+    await fs.mkdir(LOG_DIR, { recursive: true });
+    await fs.appendFile(FINGERPRINT_LOG, `${JSON.stringify(snapshot)}\n`);
+  } catch {
+    // 页面已关闭或不支持 evaluate 时忽略
+  }
+}
+
+/**
+ * 输入类动作的前置断言：后台标签页的输入事件会被浏览器丢弃。
+ * 不可见时先尝试前置，仍不可见则明确报错，不静默发送。
+ */
+async function ensurePageVisible(target) {
+  if (!VISIBILITY_GUARD) {
+    return;
+  }
+  const stateOf = () => target.evaluate(() => document.visibilityState).catch(() => "unknown");
+  if ((await stateOf()) === "visible") {
+    return;
+  }
+  await target.bringToFront().catch(() => {});
+  if ((await stateOf()) === "visible") {
+    return;
+  }
+  throw new Error(
+    "页面当前不可见（visibilityState 非 visible），输入事件会被浏览器丢弃：请调用 open_browser({foreground:true}) 或先切换到该标签页"
+  );
 }
 
 // 用户的 Chrome 是否已在运行：按可执行文件绝对路径判断，
@@ -93,6 +192,26 @@ async function isBrowserRunning() {
   } catch {
     return false;
   }
+}
+
+// 用户的 Chrome 已在运行、但调试端口不是默认 9222 时，从进程命令行里提取真实的
+// --remote-debugging-port 并逐个探测：命中即直接附着该实例，无需重启、无需改动 profile。
+async function detectRunningDebugPort() {
+  const script = `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object { $_.CommandLine -and $_.CommandLine -notlike '*--type=*' -and $_.CommandLine -like '*--remote-debugging-port=*' } | ForEach-Object { $_.CommandLine }`;
+  let stdout = "";
+  try {
+    ({ stdout } = await execFileAsync("powershell", ["-NoProfile", "-Command", script]));
+  } catch {
+    return null;
+  }
+  const ports = [...new Set([...stdout.matchAll(/--remote-debugging-port=(\d+)/g)].map((m) => m[1]))];
+  for (const port of ports) {
+    const endpoint = `http://127.0.0.1:${port}`;
+    if (await isCdpUp(endpoint)) {
+      return { endpoint, port };
+    }
+  }
+  return null;
 }
 
 // 轮询等待调试端口就绪
@@ -253,6 +372,8 @@ async function finishCreation(created) {
   if (evicted.length) {
     tabs.markReclaimed(evicted.length);
   }
+  await relaxFocusEmulation(created);
+  await recordFingerprint(created);
   return created;
 }
 
@@ -512,9 +633,14 @@ const server = new McpServer(
 
 /* ------------------------------ 生命周期 ------------------------------ */
 
-server.tool("open_browser", {}, async () => {
+server.tool("open_browser", {
+  foreground: z.boolean().default(false)
+    .describe("true 时把会话页置前（写操作需要真实焦点时使用）；默认后台打开，不抢用户焦点")
+}, async ({ foreground }) => {
   if (browser && page && !page.isClosed()) {
-    return { content: [{ type: "text", text: "浏览器已经打开" }] };
+    return {
+      content: [{ type: "text", text: `浏览器已经打开；${describeRoute(page.url())}` }]
+    };
   }
   if (browser) {
     await detachOrClose();
@@ -522,28 +648,36 @@ server.tool("open_browser", {}, async () => {
 
   // 只允许附着用户 Chrome，任何情况下都不启动替代浏览器
   let launchedByUs = false;
+  let portTip = "";
   if (!(await isCdpUp())) {
     if (await isBrowserRunning()) {
-      // 已在运行的 Chrome 无法事后开启调试端口，只能整体重启一次（标签页可恢复）
-      return {
-        content: [{
-          type: "text",
-          text: `❌ Chrome 正在运行但未开启调试端口，无法复用登录态。\n请调用 restart_chrome_with_debugging 重启 Chrome（会恢复上次标签页），或手动完全退出 Chrome 后再调用 open_browser。本工具不会启动替代浏览器。`
-        }]
-      };
-    }
-    launchedByUs = await launchUserChrome();
-    if (!launchedByUs) {
-      return {
-        content: [{
-          type: "text",
-          text: `❌ 无法在 ${CDP_ENDPOINT} 上拉起用户 Chrome（exe：${CHROME_PATH}，profile 联接：${DEBUG_PROFILE}）。请确认 Chrome 已安装、profile 可读。本工具不会启动替代浏览器。`
-        }]
-      };
+      // 已在运行的进程无法事后开端口；但若它启动时用的是其他调试端口，可直接改附该端口
+      const found = await detectRunningDebugPort();
+      if (!found) {
+        // 已在运行的 Chrome 无法事后开启调试端口，只能整体重启一次（标签页可恢复）
+        return {
+          content: [{
+            type: "text",
+            text: `❌ Chrome 正在运行，但未发现可用的调试端口（已检查默认 9222 与进程命令行中的其他端口），无法复用登录态。\n一次性修复：调用 migrate_chrome_launch（会把原快捷方式改成自带端口，并只重启这一次，之后从原图标启动即可随时被接管）。\n临时办法：调用 restart_chrome_with_debugging 重启本次，但换回原图标启动后仍会复发。本工具不会启动替代浏览器。`
+          }]
+        };
+      }
+      cdpEndpoint = found.endpoint;
+      portTip = `；Chrome 运行在非默认调试端口 ${found.port}，已自动改附该实例`;
+    } else {
+      launchedByUs = await launchUserChrome();
+      if (!launchedByUs) {
+        return {
+          content: [{
+            type: "text",
+            text: `❌ 无法在 ${cdpEndpoint} 上拉起用户 Chrome（exe：${CHROME_PATH}，profile 联接：${DEBUG_PROFILE}）。请确认 Chrome 已安装、profile 可读。本工具不会启动替代浏览器。`
+          }]
+        };
+      }
     }
   }
 
-  browser = await chromium.connectOverCDP(CDP_ENDPOINT);
+  browser = await chromium.connectOverCDP(cdpEndpoint);
   // 默认上下文即用户真实 profile，Cookie / localStorage / IndexedDB 全部直接复用
   const ctx = browser.contexts()[0];
   // 必须在建页前安装：init script 会对本上下文所有新页面生效
@@ -556,16 +690,26 @@ server.tool("open_browser", {}, async () => {
 
   // 在独立窗口后台开页：不与用户标签混在一起，也不把用户当前标签切走
   page = await createBackgroundPage();
+  if (foreground) {
+    // 写操作需要真实焦点时，把会话页真正置前，让 visibilityState 与 hasFocus 一致
+    await page.bringToFront().catch(() => {});
+  }
   human = await createStealthHuman(page);
   startIdleReaper();
 
   const cookieCount = (await ctx.cookies().catch(() => [])).length;
   const tip = launchedByUs
     ? `Chrome 未运行，已用真实 profile 启动并附着（${DEBUG_PROFILE}），Cookie ${cookieCount} 条`
-    : `已附着到本机 Chrome（${CDP_ENDPOINT}），复用真实 profile，Cookie ${cookieCount} 条`;
+    : `已附着到本机 Chrome（${cdpEndpoint}），复用真实 profile，Cookie ${cookieCount} 条${portTip}`;
   const cleaned = swept ? `；已清理上次残留标签 ${swept} 个` : "";
+  const focusTip = foreground ? "；会话页已前置" : "";
   const limit = `标签上限 ${MAX_TABS} 个（超出自动关闭最久未使用的页），任务结束请调用 close_browser 释放标签页`;
-  return { content: [{ type: "text", text: `✅ ${tip}${cleaned}；${limit}` }] };
+  return {
+    content: [{
+      type: "text",
+      text: `✅ ${tip}${cleaned}${focusTip}；${describeRoute(page.url())}；${limit}`
+    }]
+  };
 });
 
 /**
@@ -598,10 +742,7 @@ server.tool("close_browser", {}, async () => {
 });
 
 // 让用户 Chrome 具备可附着能力：已在运行的实例无法事后开端口，只能优雅重启一次
-server.tool("restart_chrome_with_debugging", {}, async () => {
-  if (await isCdpUp()) {
-    return { content: [{ type: "text", text: `✅ 调试端口已就绪：${CDP_ENDPOINT}` }] };
-  }
+async function restartChromeOnce() {
   if (browser) {
     await detachOrClose();
   }
@@ -610,6 +751,18 @@ server.tool("restart_chrome_with_debugging", {}, async () => {
     closed = await closeChromeGracefully();
   }
   if (!closed) {
+    return { ok: false, reason: "timeout" };
+  }
+  const ok = await launchUserChrome();
+  return { ok, reason: ok ? null : "launch_failed" };
+}
+
+server.tool("restart_chrome_with_debugging", {}, async () => {
+  if (await isCdpUp()) {
+    return { content: [{ type: "text", text: `✅ 调试端口已就绪：${CDP_ENDPOINT}` }] };
+  }
+  const result = await restartChromeOnce();
+  if (result.reason === "timeout") {
     return {
       content: [{
         type: "text",
@@ -617,13 +770,93 @@ server.tool("restart_chrome_with_debugging", {}, async () => {
       }]
     };
   }
-  const ok = await launchUserChrome();
   return {
     content: [{
       type: "text",
-      text: ok
+      text: result.ok
         ? `✅ 已用真实 profile 重启 Chrome 并开启调试端口（${DEBUG_PROFILE}），已尝试恢复上次标签页`
         : `❌ 重启后调试端口仍未就绪。请检查 ${DEBUG_PROFILE} 是否为可创建的联接路径、以及 ${CDP_ENDPOINT} 是否被占用。`
+    }]
+  };
+});
+
+// 一次性迁移：把桌面/开始菜单/任务栏的 Chrome 快捷方式改成自带调试端口的形态。
+// 迁移后用户照旧点原图标启动，MCP 随时可附着，不必再关闭浏览器。
+server.tool("migrate_chrome_launch", {
+  restart: z.boolean().default(true)
+    .describe("true 时若端口未就绪，立即重启一次 Chrome 让迁移生效（会恢复上次标签页）")
+}, async ({ restart }) => {
+  let patched;
+  try {
+    patched = await patchChromeShortcuts({
+      debugProfile: DEBUG_PROFILE,
+      port: new URL(CDP_ENDPOINT).port || "9222"
+    });
+  } catch (error) {
+    return {
+      content: [{ type: "text", text: `❌ 快捷方式迁移失败：${error.message}` }]
+    };
+  }
+
+  // 开机自启项也要同步：否则每次开机先起一个无端口的默认 profile 实例，问题复发
+  let autolaunch;
+  try {
+    autolaunch = await patchChromeAutolaunch({
+      debugProfile: DEBUG_PROFILE,
+      port: new URL(CDP_ENDPOINT).port || "9222"
+    });
+  } catch (error) {
+    autolaunch = { patched: [], skipped: [], failed: [{ name: "Runner", error: error.message }] };
+  }
+
+  const summary =
+    patched.patched.length > 0
+      ? `已改造 ${patched.patched.length} 个快捷方式（原文件备份为 .bak${patched.elevated ? "，已通过管理员授权写入系统目录" : ""}）`
+      : "没有需要改造的快捷方式";
+  const skippedTip = patched.skipped.length > 0 ? `；${patched.skipped.length} 个已带端口，跳过` : "";
+  const autolaunchTip =
+    autolaunch.patched.length > 0
+      ? `；开机自启项已同步 ${autolaunch.patched.length} 个（避免每次开机先起无端口实例）`
+      : "";
+  const failedTip =
+    patched.failed.length > 0 || autolaunch.failed.length > 0
+      ? `\n⚠️ 写入失败：\n${[
+          ...patched.failed.map((row) => `- ${row.file}：${row.error}`),
+          ...autolaunch.failed.map((row) => `- ${row.name}：${row.error}`)
+        ].join("\n")}`
+      : "";
+
+  if (await isCdpUp()) {
+    return {
+      content: [{
+        type: "text",
+        text: `✅ ${summary}${skippedTip}${autolaunchTip}；调试端口已就绪（${CDP_ENDPOINT}），之后无需再关闭浏览器${failedTip}`
+      }]
+    };
+  }
+  if (!restart) {
+    return {
+      content: [{
+        type: "text",
+        text: `✅ ${summary}${skippedTip}${autolaunchTip}；当前 Chrome 仍是旧启动方式，下次从原图标启动即生效，或传 restart=true 立即重启生效${failedTip}`
+      }]
+    };
+  }
+  const result = await restartChromeOnce();
+  if (result.reason === "timeout") {
+    return {
+      content: [{
+        type: "text",
+        text: `✅ ${summary}${skippedTip}${autolaunchTip}；但 Chrome 未能自动退出（可能有未保存内容或未确认的弹窗），请手动退出后再次调用 open_browser${failedTip}`
+      }]
+    };
+  }
+  return {
+    content: [{
+      type: "text",
+      text: result.ok
+        ? `✅ ${summary}${skippedTip}${autolaunchTip}；已重启 Chrome 并开启调试端口（${DEBUG_PROFILE}），之后从原图标启动也自带端口，无需再关闭浏览器${failedTip}`
+        : `✅ ${summary}${skippedTip}${autolaunchTip}；但重启后端口仍未就绪，请手动从原图标启动一次再调用 open_browser${failedTip}`
     }]
   };
 });
@@ -632,7 +865,9 @@ server.tool("restart_chrome_with_debugging", {}, async () => {
 
 server.tool("goto", { url: z.string() }, async ({ url }) => {
   await requirePage().goto(url, { timeout: 30000, waitUntil: "domcontentloaded" });
-  return { content: [{ type: "text", text: `✅ 已打开: ${url}` }] };
+  return {
+    content: [{ type: "text", text: `✅ 已打开: ${url}；${describeRoute(url)}` }]
+  };
 });
 
 server.tool("page_info", {}, async () => {
@@ -646,32 +881,59 @@ server.tool("page_info", {}, async () => {
     mcpWindowId,
     sessionTabs: tabs.size(),
     maxTabs: MAX_TABS,
-    frames: listFrames(p)
+    frames: listFrames(p),
+    route: routeFor(p.url(), STRICT_SITES)
   };
+  if (DEBUG_FINGERPRINT && lastFingerprint) {
+    info.fingerprint = lastFingerprint;
+  }
   return { content: [{ type: "text", text: JSON.stringify(info, null, 2) }] };
 });
 
 // Playwright 1.49+ 用 ariaSnapshot，page.accessibility() 已移除
-server.tool("get_accessibility_tree", { frame: frameShape }, async ({ frame }) => {
-  const snapshot = await scopeOf(requirePage(), frame).locator("body").ariaSnapshot();
-  return { content: [{ type: "text", text: snapshot || "（页面无可访问性内容）" }] };
-});
+server.tool(
+  "get_accessibility_tree",
+  "读路径优先级最低之一：优先用 capture_network 重放或 evaluate 取结构化数据，无障碍树仅在需要定位交互元素时使用。",
+  { frame: frameShape },
+  async ({ frame }) => {
+    const snapshot = await scopeOf(requirePage(), frame).locator("body").ariaSnapshot();
+    return { content: [{ type: "text", text: snapshot || "（页面无可访问性内容）" }] };
+  }
+);
 
 // 页面可见文本，比无障碍树更简洁，适合 AI 快速理解页面
-server.tool("page_text", { frame: frameShape, maxChars: z.number().default(20000) }, async ({ frame, maxChars }) => {
-  const text = await scopeOf(requirePage(), frame).locator("body").innerText();
-  return {
-    content: [{
-      type: "text",
-      text: text.length > maxChars ? `${text.slice(0, maxChars)}\n…（已截断）` : text
-    }]
-  };
-});
+server.tool(
+  "page_text",
+  "读路径最后手段：优先 capture_network 重放 / evaluate 结构化取值；确实要读正文时用 selector 限定区域，并用 maxChars 控制回传体积。",
+  {
+    selector: z.string().default("body").describe("要读取的元素选择器，默认整页 body；限定区域可显著降低 token"),
+    frame: frameShape,
+    maxChars: z.number().default(8000).describe("回传字符上限，超出截断并回报剩余字符数")
+  },
+  async ({ selector, frame, maxChars }) => {
+    const text = await scopeOf(requirePage(), frame).locator(selector).first().innerText();
+    if (text.length <= maxChars) {
+      return { content: [{ type: "text", text }] };
+    }
+    const rest = text.length - maxChars;
+    return {
+      content: [{
+        type: "text",
+        text: `${text.slice(0, maxChars)}\n…（已截断，共 ${text.length} 字符，剩余 ${rest} 字符未读；可用 selector 缩小范围或继续分段读取）`
+      }]
+    };
+  }
+);
 
-server.tool("screenshot", { fullPage: z.boolean().default(false) }, async ({ fullPage }) => {
-  const buf = await requirePage().screenshot({ fullPage });
-  return { content: [{ type: "image", data: buf.toString("base64"), mimeType: "image/png" }] };
-});
+server.tool(
+  "screenshot",
+  "读路径成本最高：截图体积远大于文本，仅在必须看视觉布局时使用。",
+  { fullPage: z.boolean().default(false) },
+  async ({ fullPage }) => {
+    const buf = await requirePage().screenshot({ fullPage });
+    return { content: [{ type: "image", data: buf.toString("base64"), mimeType: "image/png" }] };
+  }
+);
 
 // 显式等待：元素出现 / 页面加载态，避免 AI 盲等
 server.tool("wait_for", {
@@ -707,22 +969,95 @@ server.tool("evaluate", {
 /* ------------------------------ 拟人指针操作 ------------------------------ */
 
 // 所有拟人动作前插入随机抖动，避免固定节奏被行为风控统计识别。
-// MCP_ACTION_JITTER_MS=0 可关闭。
+// 同时做可见性前置断言：后台页的输入会被浏览器丢弃，静默失败比报错更难排查。
+// MCP_ACTION_JITTER_MS=0 可关闭抖动，MCP_VISIBILITY_GUARD=0 可关闭断言。
 function humanTool(name, schema, handler) {
   server.tool(name, schema, async (...args) => {
+    await ensurePageVisible(requirePage());
     await stealthPause();
     return handler(...args);
   });
 }
 
+// 指针记忆：贝塞尔轨迹的起点取上一次落点，未知时按相对位置近似
+let pointer = null;
+
+function pointerTargetOf(p, target) {
+  return typeof target === "string" ? p.locator(target).first() : target;
+}
+
+/** 把目标解析成视口坐标；解析失败返回 null（轨迹只是补充，失败不阻塞点击） */
+async function centerOf(p, target) {
+  try {
+    const box = await pointerTargetOf(p, target).boundingBox();
+    if (!box) {
+      return null;
+    }
+    return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  } catch {
+    return null;
+  }
+}
+
+/** 点击前的 2~3 段贝塞尔移动，消除「瞬移点击」的轨迹特征；不返回中间态 */
+async function approachByCurve(p, target) {
+  if (!POINTER_TRAIL) {
+    return;
+  }
+  const end = await centerOf(p, target);
+  if (!end) {
+    return;
+  }
+  const start = pointer || { x: Math.max(0, end.x - 160), y: Math.max(0, end.y - 120) };
+  const segments = 2 + Math.floor(Math.random() * 2);
+  const cx = (start.x + end.x) / 2 + (Math.random() - 0.5) * 120;
+  const cy = (start.y + end.y) / 2 + (Math.random() - 0.5) * 120;
+  try {
+    for (let i = 1; i <= segments; i += 1) {
+      const t = i / segments;
+      const x = (1 - t) ** 2 * start.x + 2 * (1 - t) * t * cx + t ** 2 * end.x;
+      const y = (1 - t) ** 2 * start.y + 2 * (1 - t) * t * cy + t ** 2 * end.y;
+      await human.move({ x: Math.round(x), y: Math.round(y) });
+      if (i < segments) {
+        await sleep(15 + Math.floor(Math.random() * 25));
+      }
+    }
+    pointer = { x: Math.round(end.x), y: Math.round(end.y) };
+  } catch {
+    // 轨迹失败时直接点击，不影响主流程
+  }
+}
+
+/** 按 8~12 字符分块输入，块间停 50~150ms，避免整段一次性注入 */
+async function typeInChunks(input, text) {
+  let index = 0;
+  while (index < text.length) {
+    const span = TYPE_CHUNK_MIN + Math.floor(Math.random() * (TYPE_CHUNK_MAX - TYPE_CHUNK_MIN + 1));
+    await human.type(input, text.slice(index, index + span));
+    index += span;
+    if (index < text.length) {
+      await sleep(TYPE_GAP_MIN_MS + Math.floor(Math.random() * (TYPE_GAP_MAX_MS - TYPE_GAP_MIN_MS + 1)));
+    }
+  }
+}
+
 humanTool("human_click", pointerShape, async (args) => {
-  const target = scopedTarget(requirePage(), args);
+  const p = requirePage();
+  const target = scopedTarget(p, args);
+  // frame 内的坐标语义与主文档不同，只有主文档目标才做轨迹
+  if (args.frame === undefined) {
+    await approachByCurve(p, target);
+  }
   await human.click(target);
   return { content: [{ type: "text", text: `✅ 拟人点击 ${describeTarget(args)}` }] };
 });
 
 humanTool("human_double_click", pointerShape, async (args) => {
-  const target = scopedTarget(requirePage(), args);
+  const p = requirePage();
+  const target = scopedTarget(p, args);
+  if (args.frame === undefined) {
+    await approachByCurve(p, target);
+  }
   await human.doubleClick(target);
   return { content: [{ type: "text", text: `✅ 拟人双击 ${describeTarget(args)}` }] };
 });
@@ -742,6 +1077,7 @@ humanTool("human_hover", { selector: z.string(), frame: frameShape }, async ({ s
 humanTool("human_move", { x: z.number(), y: z.number() }, async ({ x, y }) => {
   await requirePage();
   await human.move({ x, y });
+  pointer = { x, y };
   return { content: [{ type: "text", text: `✅ 拟人移动到 (${x},${y})` }] };
 });
 
@@ -771,7 +1107,7 @@ humanTool("human_type", {
     if (usePaste) {
       await human.paste(input, text);
     } else {
-      await human.type(input, text);
+      await typeInChunks(input, text);
     }
   } catch {
     await p.keyboard.type(text, { delay: 60 });
@@ -914,14 +1250,19 @@ server.tool("new_tab", { url: z.string() }, async ({ url }) => {
     page = existing;
     tabs.setCurrent(page);
     human = await createStealthHuman(page);
-    return { content: [{ type: "text", text: `♻️ 已有相同地址的标签页，已直接切换: ${url}` }] };
+    return {
+      content: [{ type: "text", text: `♻️ 已有相同地址的标签页，已直接切换: ${url}；${describeRoute(url)}` }]
+    };
   }
   page = await createBackgroundPage(url);
   human = await createStealthHuman(page);
   const where = tabGroupMode ? `标签组「${TAB_GROUP_TITLE}」` : "用户浏览器窗口（未分组）";
   const extra = lastEvicted ? `；已达上限 ${MAX_TABS}，已自动关闭 ${lastEvicted} 个最久未使用的页` : "";
   return {
-    content: [{ type: "text", text: `✅ 已在${where}后台打开标签页（未抢焦点）: ${url}${extra}` }]
+    content: [{
+      type: "text",
+      text: `✅ 已在${where}后台打开标签页（未抢焦点）: ${url}；${describeRoute(url)}${extra}`
+    }]
   };
 });
 

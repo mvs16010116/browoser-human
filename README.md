@@ -7,9 +7,10 @@
 | 原则 | 实现 |
 |---|---|
 | 复用真实登录态 | 通过 CDP 附着用户 Chrome，`browser.contexts()[0]` 就是真实 profile |
-| 绝不抢焦点 | 新页面用 `Target.createTarget({ background: true, focus: false })`，输入走 CDP `Input` 域，不调用 `bringToFront` |
+| 默认不抢焦点 | 新页面用 `Target.createTarget({ background: true, focus: false })`；需要真实焦点时才用 `open_browser({foreground:true})` 或由可见性断言自动激活 |
 | 不与用户标签混在一起 | 优先借扩展把标签加入独立分组；扩展不可用时退化为同窗口后台标签 |
 | 不启动替代浏览器 | 调试端口不可用时直接报错并给出修复指引，绝不降级到 Playwright 自带浏览器 |
+| 强风控站点走扩展通道 | `MCP_STRICT_SITES` 登记站点后缀，`goto` / `new_tab` / `page_info` 明确回报建议通道 |
 
 ## 前置条件
 
@@ -34,6 +35,44 @@ chrome.exe --remote-debugging-port=9222 --user-data-dir="%LOCALAPPDATA%\ChromeDe
 ```
 
 验证：`curl http://127.0.0.1:9222/json/version` 有返回即就绪。
+
+### 一次性迁移：让原图标启动的 Chrome 自带端口
+
+`--remote-debugging-port` 只在进程启动那一刻生效，运行中的 Chrome 无法事后开端口。若用户始终用原始快捷方式启动，就会反复出现「必须先关浏览器才能接管」——体验不可接受。
+
+调用一次 `migrate_chrome_launch` 即可永久解决：它把桌面 / 公共桌面 / 开始菜单 / 任务栏中指向 `chrome.exe` 的 `.lnk` 参数改成
+
+```
+--user-data-dir="%LOCALAPPDATA%\ChromeDebugUserData" --remote-debugging-port=9222
+```
+
+（原有参数保留，原文件备份为同名 `.bak`）。系统级目录普通权限写不进去，工具会自动申请一次 UAC 授权。同时它会把 `HKCU\...\CurrentVersion\Run` 里的 `GoogleChromeAutoLaunch*` 开机自启项改成同一套参数——否则每次开机 Chrome 会先以默认 profile 无端口启动，用户再点图标就变成「已在运行但无端口」，问题照样复发。迁移完成后：
+
+- 用户照旧点原图标启动，Chrome 天生带端口，MCP 随时可附着，**不再需要关闭浏览器**；
+- 已在运行的旧实例不受影响，需要最后一次重启（`migrate_chrome_launch` 默认 `restart=true` 会自动完成）；
+- 回滚：把 `.bak` 改回原文件名即可。
+
+残留边界：从 IDE、脚本、安装器等非快捷方式路径直接拉起 `chrome.exe` 时仍不带端口；此时只要 Chrome 实例已经在跑（即由快捷方式先启动），新窗口会复用同一进程，端口照旧有效。
+
+### 调试端口自动发现（端口不是 9222 也能用）
+
+`MCP_CHROME_CDP` 只是**默认端点**，不是硬性要求。附着前若默认端点不通，服务会做一次端口自动发现：
+
+1. 读取运行中 `chrome.exe` 的命令行（排除渲染子进程），用 `--remote-debugging-port=(\d+)` 提取候选端口；
+2. 逐个探测 `http://127.0.0.1:{port}/json/version`，命中第一个可用端点即附着；
+3. 返回文案会显式说明：`Chrome 运行在非默认调试端口 9333，已自动改附该实例`。
+
+因此用户若本来就带调试端口启动（端口随意，例如 `--remote-debugging-port=9333`），**无需关闭浏览器、无需改 profile、无需重启**，直接复用当前实例与登录态。
+
+三种用户状态下的通道行为：
+
+| 用户 Chrome 状态 | 通道行为 |
+|---|---|
+| 未运行 | 服务用真实 profile（目录联接）带端口拉起并附着 |
+| 已运行且带任意调试端口 | **自动发现端口并附着**，不碰用户进程 |
+| 已运行但完全无调试端口 | 无法接管（Chrome 进程单例 + 端口仅启动时生效），提示 `migrate_chrome_launch` 一次性迁移，或 `restart_chrome_with_debugging` 临时重启一次 |
+
+> 为什么不能"新开一个窗口共用同一 data dir"：Chrome 对同一 `--user-data-dir` 有进程单例锁，第二个进程会把命令转交给已有实例后退出，新窗口仍属于那个没有端口的旧进程，CDP 依然看不到它。
 
 ## 安装
 
@@ -84,7 +123,7 @@ MCP 客户端配置示例：
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `MCP_CHROME_CDP` | `http://127.0.0.1:9222` | 调试端口地址 |
+| `MCP_CHROME_CDP` | `http://127.0.0.1:9222` | 默认调试端点；不通时会从运行中 Chrome 的命令行自动发现其他端口并改附 |
 | `MCP_CHROME_PATH` | `C:\Program Files\Google\Chrome\Application\chrome.exe` | Chrome 可执行文件路径 |
 | `MCP_CHROME_PROFILE` | `%LOCALAPPDATA%\Google\Chrome\User Data` | 真实 profile 路径 |
 | `MCP_DEBUG_PROFILE` | `%LOCALAPPDATA%\ChromeDebugUserData` | 目录联接路径 |
@@ -93,6 +132,11 @@ MCP 客户端配置示例：
 | `MCP_MAX_TABS` | `5` | 会话标签页上限，超出自动关闭最久未使用的页 |
 | `MCP_IDLE_CLOSE_MS` | `1200000` | 空闲多久后关闭全部会话标签并断开，`0` 表示不启用 |
 | `MCP_ACTION_JITTER_MS` | `180` | 拟人动作前的随机抖动上限（毫秒），`0` 表示关闭 |
+| `MCP_STRICT_SITES` | 空 | 强风控站点域名后缀，逗号分隔（如 `taobao.com,x.com`）；命中后路由建议改走 kimi-webbridge |
+| `MCP_VISIBILITY_GUARD` | `1` | 输入类动作前的可见性断言，`0` 关闭 |
+| `MCP_FOCUS_EMULATION` | `0` | 设为 `1` 恢复 Playwright 默认的焦点模拟（不建议） |
+| `MCP_POINTER_TRAIL` | `1` | 点击前的贝塞尔移动轨迹，`0` 关闭 |
+| `DEBUG_FINGERPRINT` | 未设置 | 设为 `1` 时把最近一次指纹自检结果随 `page_info` 返回 |
 
 ## 标签页回收
 
@@ -114,22 +158,49 @@ MCP 客户端配置示例：
 1. **页面 DOM 痕迹（主因）**：`@humanjs/playwright` 默认注入 `data-humanjs-cursor` 节点、`@keyframes humanjs-ripple` 样式和全局 `mousemove` 监听，站点用 `document.querySelector('[data-humanjs-cursor]')` 即可识别。现在创建 human 时固定 `cursor: false`，并在 init script 里兜底清理历史残留。
 2. **网络指纹**：`http_request` / `download_file` 默认改为页面内 `fetch`（`transport:"browser"`），TLS/JA3、HTTP/2、Header 顺序、Cookie 都是真实 Chrome，与 Kimi 的 `evaluate` 路径一致。仅当需要绕过 CORS 时才用 `transport:"api"`（Playwright APIRequestContext，指纹不同）。
 3. **行为节奏**：所有 `human_*` 动作前加入 `0 ~ MCP_ACTION_JITTER_MS` 的随机抖动，避免固定间隔被行为风控统计。
+4. **CDP 自造矛盾**：Playwright 会给后台页伪造焦点（`Emulation.setFocusEmulationEnabled(true)`），导致 `visibilityState === "hidden"` 却有 `document.hasFocus() === true`。现在建页后对该页 CDP 会话显式关闭焦点模拟。
+5. **动作特征**：`human_click` / `human_double_click` 点击前先做 2~3 段贝塞尔移动（不新增工具、不返回中间态）；`human_type` 按 8~12 字符分块，块间停 50~150ms。
+6. **可见性断言**：后台标签页的输入会被浏览器丢弃。所有 `human_*` 执行前检查 `visibilityState`，不可见时先尝试前置，仍不可见则明确报错，而不是静默失败。
 
-输入事件方面，本项目用 CDP `Input` 域产生 `isTrusted=true` 的真实键鼠事件，Kimi 用 DOM 合成事件（`isTrusted=false`）；这一点本项目本就更隐蔽，差异不在输入事件，而在上面的 DOM / 网络 / 节奏。
+输入事件方面，本项目用 CDP `Input` 域产生 `isTrusted=true` 的真实键鼠事件，Kimi 用 DOM 合成事件（`isTrusted=false`）；这一点本项目本就更隐蔽，差异不在输入事件，而在上面的 DOM / 网络 / 节奏 / 协议痕迹。
 
 不伪造 UA / 屏幕 / 插件等硬件特征：本服务复用真实 profile，这些值本来就是真的，伪造反而制造新的不一致。
 
 边界：
 
-- CDP 仍附着在页面上，严格检测 DevTools 的站点仍可能识别；这类站点请改用 Kimi WebBridge 原生方式操作。
+- CDP 仍附着在页面上，严格检测 DevTools 的站点仍可能识别（`Runtime.enable` / `Target.setAutoAttach` / 焦点模拟）；这类站点应走扩展通道，见下节。
 - 本方案只消除自动化实现差异，不绕过验证码、权限校验或平台风控规则。
 - 采集范围仅限你有权访问的账号与数据。
+
+## 通道路由（强风控站点）
+
+Playwright 附着必然向每个页面发送 `Runtime.enable`、`Target.setAutoAttach({waitForDebuggerOnStart:true})`、`Emulation.setFocusEmulationEnabled(true)`，页面内可稳定观测；kimi-webbridge 走扩展的 `chrome.*` 通道，没有这些痕迹。因此两者是**通道差异**，不是拟人度差异。
+
+处置方式：读写分离，把「该走哪条通道」显式化。
+
+1. 用 `MCP_STRICT_SITES` 登记实测会被拦的站点后缀（逗号分隔，支持子域匹配），如 `MCP_STRICT_SITES=taobao.com,x.com`
+2. `goto` / `new_tab` 的返回、以及 `page_info` 的 `route` 字段会给出建议通道与判定原因
+3. `channel: "kimi"` 时，后续写操作改走 kimi-webbridge 的 `navigate` / `snapshot` / `click` / `fill`；读仍可优先用本服务的抓包与 `evaluate`
+
+注意两条通道的输入事件不同：本服务是 CDP 真实事件（`isTrusted=true`），扩展是 DOM 合成事件（`isTrusted=false`，严格校验 `isTrusted` 的站点会拒绝）。
+
+## 读路径与 token
+
+优先级从低到高（成本）：
+
+```text
+capture_network 重放 → http_request 取接口 → evaluate 结构化取值 → get_accessibility_tree → page_text → screenshot
+```
+
+`page_text` 收口为：`selector` 可选（默认 `body`，限定区域可显著省 token）、`maxChars` 默认 8000，超限截断并回报**剩余字符数**，方便按需分段读取而不是整页重读。
+
+指纹自检（`webdriver` / `visibilityState` / `hasFocus` / 通知权限 / `window.chrome`）在每次建页后追加到 `logs/fingerprint.log`，仅 `DEBUG_FINGERPRINT=1` 时随 `page_info` 返回。
 
 ## 工具清单（36 个）
 
 **生命周期**
 
-`open_browser` `close_browser` `restart_chrome_with_debugging` `goto` `page_info` `list_tabs` `new_tab` `switch_tab` `close_tab`
+`open_browser` `close_browser` `restart_chrome_with_debugging` `migrate_chrome_launch` `goto` `page_info` `list_tabs` `new_tab` `switch_tab` `close_tab`
 
 **页面探查**
 
