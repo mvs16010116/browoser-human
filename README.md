@@ -92,6 +92,7 @@ MCP 客户端配置示例：
 | `MCP_KIMI_SESSION` | `browser-human` | 分组会话名 |
 | `MCP_MAX_TABS` | `5` | 会话标签页上限，超出自动关闭最久未使用的页 |
 | `MCP_IDLE_CLOSE_MS` | `1200000` | 空闲多久后关闭全部会话标签并断开，`0` 表示不启用 |
+| `MCP_ACTION_JITTER_MS` | `180` | 拟人动作前的随机抖动上限（毫秒），`0` 表示关闭 |
 
 ## 标签页回收
 
@@ -105,6 +106,24 @@ MCP 客户端配置示例：
 6. **启动清扫**：下次 `open_browser` 时若发现本进程尚未开页但扩展会话里已有标签，说明是上个进程被强杀留下的孤儿页，整会话关闭
 
 第 5、6 层依赖扩展桥（kimi-webbridge）：扩展未启用时，只能靠 1–4 层收敛，强杀残留需手工关闭。会话名由 `MCP_KIMI_SESSION` 决定，同名会话会被一并清理，不要用同一个会话名并行跑多个客户端。
+
+## 反检测对齐（与 Kimi 保持一致）
+
+本项目跑在用户真实 Chrome 上，原本有几类 Kimi 没有的痕迹，现已修复：
+
+1. **页面 DOM 痕迹（主因）**：`@humanjs/playwright` 默认注入 `data-humanjs-cursor` 节点、`@keyframes humanjs-ripple` 样式和全局 `mousemove` 监听，站点用 `document.querySelector('[data-humanjs-cursor]')` 即可识别。现在创建 human 时固定 `cursor: false`，并在 init script 里兜底清理历史残留。
+2. **网络指纹**：`http_request` / `download_file` 默认改为页面内 `fetch`（`transport:"browser"`），TLS/JA3、HTTP/2、Header 顺序、Cookie 都是真实 Chrome，与 Kimi 的 `evaluate` 路径一致。仅当需要绕过 CORS 时才用 `transport:"api"`（Playwright APIRequestContext，指纹不同）。
+3. **行为节奏**：所有 `human_*` 动作前加入 `0 ~ MCP_ACTION_JITTER_MS` 的随机抖动，避免固定间隔被行为风控统计。
+
+输入事件方面，本项目用 CDP `Input` 域产生 `isTrusted=true` 的真实键鼠事件，Kimi 用 DOM 合成事件（`isTrusted=false`）；这一点本项目本就更隐蔽，差异不在输入事件，而在上面的 DOM / 网络 / 节奏。
+
+不伪造 UA / 屏幕 / 插件等硬件特征：本服务复用真实 profile，这些值本来就是真的，伪造反而制造新的不一致。
+
+边界：
+
+- CDP 仍附着在页面上，严格检测 DevTools 的站点仍可能识别；这类站点请改用 Kimi WebBridge 原生方式操作。
+- 本方案只消除自动化实现差异，不绕过验证码、权限校验或平台风控规则。
+- 采集范围仅限你有权访问的账号与数据。
 
 ## 工具清单（36 个）
 
@@ -122,7 +141,7 @@ MCP 客户端配置示例：
 
 **其他**
 
-`dialog_settings`（alert/confirm 策略）`download_file`（带 Referer 下载到任意路径）`capture_network`（网络抓包）`http_request`（直接调用接口）
+`dialog_settings`（alert/confirm 策略）`download_file`（默认页面内 fetch 下载；`transport:"api"` 使用 APIRequestContext）`capture_network`（网络抓包）`http_request`（默认页面内 fetch；`transport:"api"` 可绕过 CORS）
 
 ## iframe（frame）支持
 

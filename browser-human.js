@@ -67,6 +67,22 @@ async function isCdpUp() {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// 反风控：humanjs 默认会在页面里注入可视化鼠标助手：
+//   <div data-humanjs-cursor> + <style>@keyframes humanjs-ripple</style> + mousemove 监听
+// 这是可被站点直接 querySelector 到的 DOM 痕迹，Kimi 不注入这类元素。
+// 关闭 cursor 后仍保留 CDP Input 的真实键鼠事件（isTrusted=true），不损失拟人输入能力。
+const HUMAN_OPTIONS = { personality: "careful", seed: 12345, cursor: false };
+const ACTION_JITTER_MS = Number(process.env.MCP_ACTION_JITTER_MS ?? 180);
+
+function createStealthHuman(page) {
+  return createHuman(page, HUMAN_OPTIONS);
+}
+
+async function stealthPause() {
+  if (ACTION_JITTER_MS <= 0) return;
+  await sleep(Math.floor(Math.random() * ACTION_JITTER_MS));
+}
+
 // 用户的 Chrome 是否已在运行：按可执行文件绝对路径判断，
 // 避免把 Playwright 自带的同名 chrome.exe 误认成用户的浏览器
 async function isBrowserRunning() {
@@ -370,6 +386,41 @@ function attachDialogHandler(p) {
 }
 
 /**
+ * 在所有页面加载前安装最小反检测脚本：
+ * 1) 删除 navigator.webdriver（若运行时被注入），避免自动化布尔值被读取；
+ * 2) 兜底清理历史页面可能残留的 humanjs 鼠标助手 DOM 与样式。
+ * 注意：不伪造 UA / 屏幕 / 插件等真实硬件特征——本服务跑在用户真实 Chrome 上，
+ * 这些值本来就是真的，伪造反而会制造新的不一致。
+ */
+async function installStealthInitScript(ctx) {
+  await ctx.addInitScript(() => {
+    const drop = (obj, key) => {
+      try {
+        const d = Object.getOwnPropertyDescriptor(obj, key);
+        if (d && d.configurable) delete obj[key];
+      } catch {
+        // 不可配置属性无法删除，保持原样即可
+      }
+    };
+    drop(Navigator.prototype, "webdriver");
+    drop(navigator, "webdriver");
+    drop(window, "webdriver");
+
+    const cleanHumanjsArtifacts = () => {
+      document.querySelectorAll("[data-humanjs-cursor]").forEach((el) => el.remove());
+      document.querySelectorAll("style").forEach((el) => {
+        if (el.textContent && el.textContent.includes("humanjs-ripple")) el.remove();
+      });
+    };
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", cleanHumanjsArtifacts, { once: true });
+    } else {
+      cleanHumanjsArtifacts();
+    }
+  }).catch(() => {});
+}
+
+/**
  * 取当前可用页面，浏览器未启动或页面已关闭时给出可操作的提示。
  */
 function requirePage() {
@@ -495,6 +546,8 @@ server.tool("open_browser", {}, async () => {
   browser = await chromium.connectOverCDP(CDP_ENDPOINT);
   // 默认上下文即用户真实 profile，Cookie / localStorage / IndexedDB 全部直接复用
   const ctx = browser.contexts()[0];
+  // 必须在建页前安装：init script 会对本上下文所有新页面生效
+  await installStealthInitScript(ctx);
   // human.paste 依赖剪贴板权限，真实 profile 未授权时静默失败
   await ctx.grantPermissions(["clipboard-read", "clipboard-write"]).catch(() => {});
 
@@ -503,7 +556,7 @@ server.tool("open_browser", {}, async () => {
 
   // 在独立窗口后台开页：不与用户标签混在一起，也不把用户当前标签切走
   page = await createBackgroundPage();
-  human = await createHuman(page, { personality: "careful", seed: 12345 });
+  human = await createStealthHuman(page);
   startIdleReaper();
 
   const cookieCount = (await ctx.cookies().catch(() => [])).length;
@@ -653,37 +706,46 @@ server.tool("evaluate", {
 
 /* ------------------------------ 拟人指针操作 ------------------------------ */
 
-server.tool("human_click", pointerShape, async (args) => {
+// 所有拟人动作前插入随机抖动，避免固定节奏被行为风控统计识别。
+// MCP_ACTION_JITTER_MS=0 可关闭。
+function humanTool(name, schema, handler) {
+  server.tool(name, schema, async (...args) => {
+    await stealthPause();
+    return handler(...args);
+  });
+}
+
+humanTool("human_click", pointerShape, async (args) => {
   const target = scopedTarget(requirePage(), args);
   await human.click(target);
   return { content: [{ type: "text", text: `✅ 拟人点击 ${describeTarget(args)}` }] };
 });
 
-server.tool("human_double_click", pointerShape, async (args) => {
+humanTool("human_double_click", pointerShape, async (args) => {
   const target = scopedTarget(requirePage(), args);
   await human.doubleClick(target);
   return { content: [{ type: "text", text: `✅ 拟人双击 ${describeTarget(args)}` }] };
 });
 
-server.tool("human_right_click", pointerShape, async (args) => {
+humanTool("human_right_click", pointerShape, async (args) => {
   const target = scopedTarget(requirePage(), args);
   await human.rightClick(target);
   return { content: [{ type: "text", text: `✅ 拟人右键 ${describeTarget(args)}` }] };
 });
 
 // hover 只接受 Locator|string，坐标请用 human_move
-server.tool("human_hover", { selector: z.string(), frame: frameShape }, async ({ selector, frame }) => {
+humanTool("human_hover", { selector: z.string(), frame: frameShape }, async ({ selector, frame }) => {
   await human.hover(frameLocator(requirePage(), frame, selector));
   return { content: [{ type: "text", text: `✅ 拟人悬停 ${describeTarget({ selector, frame })}` }] };
 });
 
-server.tool("human_move", { x: z.number(), y: z.number() }, async ({ x, y }) => {
+humanTool("human_move", { x: z.number(), y: z.number() }, async ({ x, y }) => {
   await requirePage();
   await human.move({ x, y });
   return { content: [{ type: "text", text: `✅ 拟人移动到 (${x},${y})` }] };
 });
 
-server.tool("human_drag", {
+humanTool("human_drag", {
   from: z.object({ selector: z.string().optional(), x: z.number().optional(), y: z.number().optional(), frame: frameShape }),
   to: z.object({ selector: z.string().optional(), x: z.number().optional(), y: z.number().optional(), frame: frameShape })
 }, async ({ from, to }) => {
@@ -696,7 +758,7 @@ server.tool("human_drag", {
 
 // 坐标输入：先点击聚焦，再用 ':focus' 定位刚获得焦点的元素；
 // frame 内直接用 Locator 作为输入目标，避免 ':focus' 落到主文档
-server.tool("human_type", {
+humanTool("human_type", {
   ...pointerShape,
   text: z.string(),
   usePaste: z.boolean().default(false)
@@ -717,18 +779,18 @@ server.tool("human_type", {
   return { content: [{ type: "text", text: `✅ 拟人输入：${text}` }] };
 });
 
-server.tool("human_paste", { selector: z.string(), text: z.string(), frame: frameShape }, async ({ selector, text, frame }) => {
+humanTool("human_paste", { selector: z.string(), text: z.string(), frame: frameShape }, async ({ selector, text, frame }) => {
   await human.paste(frameLocator(requirePage(), frame, selector), text);
   return { content: [{ type: "text", text: `✅ 已粘贴到 ${selector}` }] };
 });
 
-server.tool("human_clear", { selector: z.string(), frame: frameShape }, async ({ selector, frame }) => {
+humanTool("human_clear", { selector: z.string(), frame: frameShape }, async ({ selector, frame }) => {
   await human.clear(frameLocator(requirePage(), frame, selector));
   return { content: [{ type: "text", text: `✅ 已清空 ${selector}` }] };
 });
 
 // 键盘：Enter / Tab / Escape / Control+A / Shift+Tab 等
-server.tool("human_press", { key: z.string() }, async ({ key }) => {
+humanTool("human_press", { key: z.string() }, async ({ key }) => {
   await requirePage();
   const result = await human.press(key);
   return { content: [{ type: "text", text: `✅ 已按键 ${result?.dispatched || key}` }] };
@@ -736,17 +798,17 @@ server.tool("human_press", { key: z.string() }, async ({ key }) => {
 
 /* ------------------------------ 表单控件 ------------------------------ */
 
-server.tool("human_check", { selector: z.string(), frame: frameShape }, async ({ selector, frame }) => {
+humanTool("human_check", { selector: z.string(), frame: frameShape }, async ({ selector, frame }) => {
   await human.check(frameLocator(requirePage(), frame, selector));
   return { content: [{ type: "text", text: `✅ 已勾选 ${selector}` }] };
 });
 
-server.tool("human_uncheck", { selector: z.string(), frame: frameShape }, async ({ selector, frame }) => {
+humanTool("human_uncheck", { selector: z.string(), frame: frameShape }, async ({ selector, frame }) => {
   await human.uncheck(frameLocator(requirePage(), frame, selector));
   return { content: [{ type: "text", text: `✅ 已取消勾选 ${selector}` }] };
 });
 
-server.tool("human_select_option", {
+humanTool("human_select_option", {
   selector: z.string(),
   values: z.union([z.string(), z.array(z.string())]),
   frame: frameShape
@@ -755,7 +817,7 @@ server.tool("human_select_option", {
   return { content: [{ type: "text", text: `✅ 已选择 ${JSON.stringify(picked)}` }] };
 });
 
-server.tool("human_upload", {
+humanTool("human_upload", {
   selector: z.string(),
   files: z.array(z.string()).describe("本地文件绝对路径列表"),
   frame: frameShape
@@ -765,7 +827,7 @@ server.tool("human_upload", {
 });
 
 // 选中文本：复制/剪切、触发划词菜单、或让"选中才可用"的按钮生效
-server.tool("human_select_text", {
+humanTool("human_select_text", {
   selector: z.string(),
   text: z.string().optional().describe("只选中这个子串；不传则选中元素全部文本"),
   frame: frameShape
@@ -781,7 +843,7 @@ server.tool("human_select_text", {
 
 /* ------------------------------ 滚动 / 阅读 / 节奏 ------------------------------ */
 
-server.tool("human_scroll", {
+humanTool("human_scroll", {
   direction: z.enum(["up", "down"]),
   pixels: z.number().default(400),
   selector: z.string().optional().describe("滚动到该元素可见；配合 frame 可滚动 iframe 内的元素"),
@@ -804,7 +866,7 @@ server.tool("human_scroll", {
 });
 
 // 拟人阅读：按词数模拟阅读停留时间，避免动作过快
-server.tool("human_read", {
+humanTool("human_read", {
   selector: z.string().default("body"),
   frame: frameShape,
   wordsPerMinute: z.number().optional()
@@ -818,7 +880,7 @@ server.tool("human_read", {
   };
 });
 
-server.tool("human_sleep", { ms: z.number() }, async ({ ms }) => {
+humanTool("human_sleep", { ms: z.number() }, async ({ ms }) => {
   await requirePage();
   await human.sleep(ms);
   return { content: [{ type: "text", text: `✅ 已等待 ${ms}ms` }] };
@@ -851,11 +913,11 @@ server.tool("new_tab", { url: z.string() }, async ({ url }) => {
   if (existing) {
     page = existing;
     tabs.setCurrent(page);
-    human = await createHuman(page, { personality: "careful", seed: 12345 });
+    human = await createStealthHuman(page);
     return { content: [{ type: "text", text: `♻️ 已有相同地址的标签页，已直接切换: ${url}` }] };
   }
   page = await createBackgroundPage(url);
-  human = await createHuman(page, { personality: "careful", seed: 12345 });
+  human = await createStealthHuman(page);
   const where = tabGroupMode ? `标签组「${TAB_GROUP_TITLE}」` : "用户浏览器窗口（未分组）";
   const extra = lastEvicted ? `；已达上限 ${MAX_TABS}，已自动关闭 ${lastEvicted} 个最久未使用的页` : "";
   return {
@@ -873,7 +935,7 @@ server.tool("switch_tab", { index: z.number() }, async ({ index }) => {
   page = pages[index];
   tabs.setCurrent(page);
   attachDialogHandler(page);
-  human = await createHuman(page, { personality: "careful", seed: 12345 });
+  human = await createStealthHuman(page);
   return { content: [{ type: "text", text: `✅ 已切换到标签页 ${index}: ${page.url()}` }] };
 });
 
@@ -906,7 +968,7 @@ server.tool("close_tab", {
     page = rest[0] || null;
     if (page) {
       tabs.setCurrent(page);
-      human = await createHuman(page, { personality: "careful", seed: 12345 });
+      human = await createStealthHuman(page);
     } else {
       human = null;
     }
@@ -940,23 +1002,45 @@ server.tool("dialog_settings", {
 server.tool("download_file", {
   url: z.string(),
   savePath: z.string(),
-  referer: z.string().optional()
-}, async ({ url, savePath, referer }) => {
+  referer: z.string().optional(),
+  transport: z.enum(["browser", "api"]).default("browser")
+    .describe("browser=页面内 fetch（默认，浏览器 TLS/Cookie 指纹）；api=Playwright APIRequestContext（可绕过 CORS，但指纹不同）")
+}, async ({ url, savePath, referer, transport }) => {
   const p = requirePage();
-  const resp = await p.context().request.get(url, {
-    headers: { Referer: referer || p.url() },
-    timeout: 60000
-  });
-  if (!resp.ok()) {
-    throw new Error(`下载失败：HTTP ${resp.status()} ${resp.statusText()}`);
+  let buf;
+  let status;
+  if (transport === "browser") {
+    // 走页面 fetch：TLS/JA3、HTTP/2、Header 顺序与真实 Chrome 一致，Kimi 也是这条路。
+    // 浏览器禁止手写 Referer/Cookie 头，自动携带当前页面的来源与 Cookie。
+    const base64 = await p.evaluate(async ({ url }) => {
+      const res = await fetch(url, { credentials: "include" });
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      let bin = "";
+      for (let i = 0; i < bytes.length; i += 32768) {
+        bin += String.fromCharCode(...bytes.subarray(i, i + 32768));
+      }
+      return btoa(bin);
+    }, { url });
+    buf = Buffer.from(base64, "base64");
+    status = 200;
+  } else {
+    const resp = await p.context().request.get(url, {
+      headers: { Referer: referer || p.url() },
+      timeout: 60000
+    });
+    if (!resp.ok()) {
+      throw new Error(`下载失败：HTTP ${resp.status()} ${resp.statusText()}`);
+    }
+    buf = await resp.body();
+    status = resp.status();
   }
-  const buf = await resp.body();
   await fs.mkdir(path.dirname(savePath), { recursive: true });
   await fs.writeFile(savePath, buf);
   return {
     content: [{
       type: "text",
-      text: `✅ 已保存 ${savePath}（${(buf.length / 1024 / 1024).toFixed(2)} MB，HTTP ${resp.status()}）`
+      text: `✅ 已保存 ${savePath}（${(buf.length / 1024 / 1024).toFixed(2)} MB，HTTP ${status}）`
     }]
   };
 });
@@ -1033,8 +1117,9 @@ server.tool("capture_network", {
 
 /* ------------------------------ 程序化调用接口 ------------------------------ */
 
-// 直接调用接口：走 Playwright 的 APIRequestContext，与浏览器共享 Cookie 存储（含 HttpOnly），
-// 不受 CORS 限制；captureIndex 可一键沿用刚抓到的 url / method / body / headers
+// 直接调用接口。默认走页面内 fetch：TLS/JA3、HTTP/2、Header 顺序、Cookie 都是真实 Chrome，
+// 与 Kimi 的 evaluate 路径一致，不会像 Node APIRequestContext 那样留下服务端指纹。
+// transport:"api" 仅在需要绕过 CORS 时使用（指纹不同，风控敏感站点请勿使用）。
 server.tool("http_request", {
   url: z.string().optional().describe("目标地址；提供 captureIndex 时可省略"),
   method: z.string().optional().describe("HTTP 方法；提供 captureIndex 时默认沿用记录值"),
@@ -1043,12 +1128,14 @@ server.tool("http_request", {
   cookies: z.union([
     z.string(),
     z.array(z.object({ name: z.string(), value: z.string() }))
-  ]).optional().describe("Cookie：字符串原样作为 Cookie 头，或 [{name,value}]（可直接用 capture_network includeCookies 的输出）；不传则自动使用浏览器 Cookie 存储"),
+  ]).optional().describe("仅 transport=api 生效：显式 Cookie；browser 模式由浏览器自动携带"),
   captureIndex: z.number().optional().describe("重放 capture_network dump 里的 index，自动沿用其 url/method/body/headers"),
-  referer: z.string().optional().describe("默认取当前页地址，模拟真实来源"),
+  referer: z.string().optional().describe("仅 transport=api 生效；browser 模式自动使用当前页来源"),
+  transport: z.enum(["browser", "api"]).default("browser")
+    .describe("browser=页面内 fetch（默认，真实 Chrome 指纹）；api=Playwright APIRequestContext（可绕过 CORS）"),
   timeoutMs: z.number().default(30000),
   maxChars: z.number().default(20000)
-}, async ({ url, method, headers, body, cookies, captureIndex, referer, timeoutMs, maxChars }) => {
+}, async ({ url, method, headers, body, cookies, captureIndex, referer, transport, timeoutMs, maxChars }) => {
   const p = requirePage();
   const captured = captureIndex === undefined ? null : capture?.get(captureIndex);
   if (captureIndex !== undefined && !captured) {
@@ -1064,7 +1151,6 @@ server.tool("http_request", {
     Referer: referer || p.url(),
     ...(headers || {})
   };
-  // 显式 Cookie 优先；不传时 APIRequestContext 自动用浏览器 Cookie 存储（含 HttpOnly）
   const cookieHeader = formatCookies(cookies);
   if (cookieHeader) {
     finalHeaders.Cookie = cookieHeader;
@@ -1074,6 +1160,42 @@ server.tool("http_request", {
   if (payload && !hasContentType) {
     finalHeaders["Content-Type"] = "application/json";
   }
+
+  if (transport === "browser") {
+    const browserHeaders = { ...finalHeaders };
+    // fetch 禁止手写这些头；浏览器会自动携带真实值，手写反而抛错或形成指纹差异
+    for (const key of Object.keys(browserHeaders)) {
+      if (["cookie", "referer", "origin", "user-agent", "host"].includes(key.toLowerCase())) {
+        delete browserHeaders[key];
+      }
+    }
+    let result;
+    try {
+      result = await p.evaluate(async ({ url, method, headers, body, timeoutMs }) => {
+        const res = await fetch(url, {
+          method,
+          headers,
+          body,
+          credentials: "include",
+          signal: AbortSignal.timeout(timeoutMs)
+        });
+        const text = await res.text();
+        return {
+          status: res.status,
+          statusText: res.statusText,
+          headers: Object.fromEntries(res.headers.entries()),
+          body: text
+        };
+      }, { url: targetUrl, method: finalMethod, headers: browserHeaders, body: payload, timeoutMs });
+    } catch (err) {
+      throw new Error(`浏览器内 fetch 失败（通常是 CORS）：${err.message}。如确认有权限且仅用于已授权接口，可改用 transport:"api"。`);
+    }
+    const summary = JSON.stringify({ status: result.status, statusText: result.statusText, headers: result.headers, transport: "browser" }, null, 2);
+    const text = result.body.length > maxChars ? `${result.body.slice(0, maxChars)}\n…（已截断，共 ${result.body.length} 字符）` : result.body;
+    const cookieNote = cookieHeader ? "\n注意：transport=browser 忽略显式 cookies，已由浏览器自动携带。" : "";
+    return { content: [{ type: "text", text: `${summary}\n\n${text}${cookieNote}` }] };
+  }
+
   const resp = await p.context().request.fetch(targetUrl, {
     method: finalMethod,
     headers: finalHeaders,
@@ -1083,7 +1205,7 @@ server.tool("http_request", {
     maxRedirects: 5
   });
   const text = await readResponse(resp, maxChars);
-  const summary = JSON.stringify({ status: resp.status(), statusText: resp.statusText(), headers: resp.headers() }, null, 2);
+  const summary = JSON.stringify({ status: resp.status(), statusText: resp.statusText(), headers: resp.headers(), transport: "api" }, null, 2);
   return { content: [{ type: "text", text: `${summary}\n\n${text}` }] };
 });
 
